@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
@@ -12,8 +13,19 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:3000" }));
-app.use(express.json());
+app.use(cors({
+  origin: process.env.FRONTEND_ORIGIN || "http://localhost:3000",
+  exposedHeaders: ["Content-Disposition"],
+}));
+app.use(express.json({ limit: "10kb" }));
+
+app.use("/api/", rateLimit({
+  windowMs: 60 * 1000, // 1 minute window
+  max: 20,             // max 20 requests per IP per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please slow down." },
+}));
 
 // Validate that the URL is a proper http/https URL to prevent command injection
 function isValidUrl(str) {
@@ -23,6 +35,31 @@ function isValidUrl(str) {
   } catch {
     return false;
   }
+}
+
+// ─── Cookie args for yt-dlp ───────────────────────────────────────────────────
+// Priority: COOKIES_BROWSER env var → cookies.txt file → nothing
+function cookieArgs() {
+  if (process.env.COOKIES_BROWSER) {
+    return ["--cookies-from-browser", process.env.COOKIES_BROWSER];
+  }
+  const cookiesFile = path.join(__dirname, "cookies.txt");
+  if (fs.existsSync(cookiesFile)) {
+    return ["--cookies", cookiesFile];
+  }
+  return [];
+}
+
+// ─── Quality helpers ────────────────────────────────────────────────────────────
+function buildVideoFormat(quality) {
+  const h = parseInt(quality, 10);
+  if (h === 720 || h === 1080) return `bestvideo[height<=${h}]+bestaudio/best`;
+  return "bestvideo+bestaudio/best"; // 2160 / default = best available
+}
+
+function buildAudioQuality(quality) {
+  if (quality === "128" || quality === "192" || quality === "320") return `${quality}K`;
+  return "0"; // best VBR
 }
 
 // ─── Title fetch (metadata only, no download) ────────────────────────────────
@@ -38,6 +75,7 @@ app.post("/api/title", (req, res) => {
     "--no-playlist",
     "--no-warnings",
     "--print", "%(title)s",
+    ...cookieArgs(),
   ];
 
   let stdout = "";
@@ -50,21 +88,22 @@ app.post("/api/title", (req, res) => {
   });
 });
 
-// ─── Info fetch: title + duration + estimated audio size ─────────────────────
+// ─── Info fetch: title + duration + estimated size ──────────────────────────
 app.post("/api/info", (req, res) => {
-  const { url } = req.body;
+  const { url, format, quality } = req.body;
   if (!url || typeof url !== "string" || !isValidUrl(url)) {
     return res.status(400).json({ error: "A valid http/https URL is required." });
   }
 
-  // Print title, duration (seconds), and best-audio filesize (may be NA)
+  const isVideo = format === "video";
   const args = [
     url,
-    "-f", "bestaudio/best",
+    "-f", isVideo ? buildVideoFormat(quality) : "bestaudio/best",
     "--simulate",
     "--no-playlist",
     "--no-warnings",
     "--print", "%(title)s\n%(duration>%H:%M:%S|0:00)s\n%(filesize,filesize_approx|NA)s",
+    ...cookieArgs(),
   ];
 
   let stdout = "";
@@ -94,31 +133,36 @@ app.post("/api/info", (req, res) => {
 });
 
 app.post("/api/download", (req, res) => {
-  const { url } = req.body;
+  const { url, format, quality } = req.body;
 
   if (!url || typeof url !== "string" || !isValidUrl(url)) {
     return res.status(400).json({ error: "A valid http/https URL is required." });
   }
 
+  const isVideo = format === "video";
   // Generate a unique temp file path
   const tmpDir = os.tmpdir();
   const fileId = crypto.randomBytes(16).toString("hex");
   const outputTemplate = path.join(tmpDir, `${fileId}.%(ext)s`);
 
-  // Single yt-dlp call:
-  //   -f bestaudio   → download only the audio stream (skips the full video entirely)
-  //   --print markers → capture title + output path without a second process
   const args = [
-    url,
-    "-f", "bestaudio/best",
-    "--extract-audio",
-    "--audio-format", "mp3",
-    "--audio-quality", "0",
+    ...(isVideo ? [
+      url,
+      "-f", buildVideoFormat(quality),
+      "--merge-output-format", "mp4",
+    ] : [
+      url,
+      "-f", "bestaudio/best",
+      "--extract-audio",
+      "--audio-format", "mp3",
+      "--audio-quality", buildAudioQuality(quality),
+    ]),
     "--no-playlist",
     "--output", outputTemplate,
     "--no-mtime",
-    "--print", "before_dl:AUDIOTITLE:%(title)s",
-    "--print", "after_move:AUDIOPATH:%(filepath)s",
+    "--print", "before_dl:FILETITLE:%(title)s",
+    "--print", "after_move:FILEPATH:%(filepath)s",
+    ...cookieArgs(),
   ];
 
   let stdoutBuf = "";
@@ -138,23 +182,24 @@ app.post("/api/download", (req, res) => {
 
   dlProc.on("close", (code) => {
     // Parse the two marker lines from stdout
-    const titleMatch = stdoutBuf.match(/^AUDIOTITLE:(.+)$/m);
-    const pathMatch  = stdoutBuf.match(/^AUDIOPATH:(.+)$/m);
+    const titleMatch = stdoutBuf.match(/^FILETITLE:(.+)$/m);
+    const pathMatch  = stdoutBuf.match(/^FILEPATH:(.+)$/m);
     const resolvedPath = pathMatch ? pathMatch[1].trim() : "";
     const videoTitle  = titleMatch
-      ? titleMatch[1].trim().replace(/[^\w\s\-().]/g, "").trim() || "audio"
-      : "audio";
+      ? titleMatch[1].trim().replace(/[^\w\s\-().]/g, "").trim() || "file"
+      : "file";
 
     if (code !== 0 || !resolvedPath || !fs.existsSync(resolvedPath)) {
       console.error("yt-dlp error:", errorOutput);
       return res.status(500).json({
-        error: "Failed to extract audio. Make sure the URL is a supported video link.",
+        error: "Failed to download. Make sure the URL is a supported video link.",
       });
     }
 
-    const safeFilename = `${videoTitle}.mp3`;
+    const ext = isVideo ? "mp4" : "mp3";
+    const safeFilename = `${videoTitle}.${ext}`;
 
-    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Type", isVideo ? "video/mp4" : "audio/mpeg");
     res.setHeader(
       "Content-Disposition",
       `attachment; filename*=UTF-8''${encodeURIComponent(safeFilename)}`
@@ -191,23 +236,31 @@ const BATCH_CONCURRENCY = 3; // parallel yt-dlp processes
  * Download one URL to a temp file. Resolves with { filePath, title } or
  * rejects with an Error if yt-dlp fails.
  */
-function downloadOne(url) {
+function downloadOne(url, format, quality) {
   return new Promise((resolve, reject) => {
     const tmpDir = os.tmpdir();
     const fileId = crypto.randomBytes(16).toString("hex");
     const outputTemplate = path.join(tmpDir, `${fileId}.%(ext)s`);
 
+    const isVideo = format === "video";
     const args = [
-      url,
-      "-f", "bestaudio/best",
-      "--extract-audio",
-      "--audio-format", "mp3",
-      "--audio-quality", "0",
+      ...(isVideo ? [
+        url,
+        "-f", buildVideoFormat(quality),
+        "--merge-output-format", "mp4",
+      ] : [
+        url,
+        "-f", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", buildAudioQuality(quality),
+      ]),
       "--no-playlist",
       "--output", outputTemplate,
       "--no-mtime",
-      "--print", "before_dl:AUDIOTITLE:%(title)s",
-      "--print", "after_move:AUDIOPATH:%(filepath)s",
+      "--print", "before_dl:FILETITLE:%(title)s",
+      "--print", "after_move:FILEPATH:%(filepath)s",
+      ...cookieArgs(),
     ];
 
     let stdoutBuf = "";
@@ -216,15 +269,16 @@ function downloadOne(url) {
     proc.stdout.on("data", (c) => { stdoutBuf += c; });
     proc.stderr.on("data", (c) => { stderrBuf += c; });
     proc.on("close", (code) => {
-      const titleMatch = stdoutBuf.match(/^AUDIOTITLE:(.+)$/m);
-      const pathMatch  = stdoutBuf.match(/^AUDIOPATH:(.+)$/m);
+      const titleMatch = stdoutBuf.match(/^FILETITLE:(.+)$/m);
+      const pathMatch  = stdoutBuf.match(/^FILEPATH:(.+)$/m);
       const filePath   = pathMatch  ? pathMatch[1].trim()  : "";
-      const title      = titleMatch ? titleMatch[1].trim().replace(/[^\w\s\-().]/g, "").trim() || "audio" : "audio";
+      const title      = titleMatch ? titleMatch[1].trim().replace(/[^\w\s\-().]/g, "").trim() || "file" : "file";
+      const ext        = isVideo ? "mp4" : "mp3";
 
       if (code !== 0 || !filePath || !fs.existsSync(filePath)) {
         return reject(new Error(`yt-dlp failed for ${url}: ${stderrBuf.slice(-300)}`));
       }
-      resolve({ filePath, title });
+      resolve({ filePath, title, ext });
     });
   });
 }
@@ -245,7 +299,7 @@ async function withConcurrency(limit, tasks) {
 }
 
 app.post("/api/download/batch", async (req, res) => {
-  const { urls } = req.body;
+  const { urls, format, quality } = req.body;
 
   if (!Array.isArray(urls) || urls.length === 0) {
     return res.status(400).json({ error: "Provide a non-empty array of URLs." });
@@ -259,7 +313,7 @@ app.post("/api/download/batch", async (req, res) => {
   }
 
   // Download all in parallel (capped)
-  const tasks = urls.map((url) => () => downloadOne(url));
+  const tasks = urls.map((url) => () => downloadOne(url, format, quality));
   const results = await withConcurrency(BATCH_CONCURRENCY, tasks);
 
   const succeeded = results.filter((r) => r.ok);
@@ -269,8 +323,9 @@ app.post("/api/download/batch", async (req, res) => {
   }
 
   // Stream a ZIP back
+  const bundleName = format === "video" ? "video-bundle.zip" : "audio-bundle.zip";
   res.setHeader("Content-Type", "application/zip");
-  res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent("audio-bundle.zip")}`);
+  res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(bundleName)}`);
 
   const archive = archiver("zip", { zlib: { level: 0 } }); // level 0 = store only (MP3s don't compress)
   archive.pipe(res);
@@ -281,7 +336,7 @@ app.post("/api/download/batch", async (req, res) => {
     const base = r.value.title;
     const count = seen.get(base) || 0;
     seen.set(base, count + 1);
-    const entryName = count === 0 ? `${base}.mp3` : `${base} (${count}).mp3`;
+    const entryName = count === 0 ? `${base}.${r.value.ext}` : `${base} (${count}).${r.value.ext}`;
     archive.file(r.value.filePath, { name: entryName });
   }
 
